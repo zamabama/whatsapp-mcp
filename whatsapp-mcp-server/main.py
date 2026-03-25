@@ -1,3 +1,4 @@
+import random
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -12,7 +13,10 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    save_contact as whatsapp_save_contact,
+    list_saved_contacts as whatsapp_list_saved_contacts,
+    resolve_lid as whatsapp_resolve_lid,
 )
 
 # Initialize FastMCP server
@@ -154,28 +158,73 @@ def get_message_context(
     context = whatsapp_get_message_context(message_id, before, after)
     return context
 
+# Pending send confirmations: maps confirmation_code -> (recipient, message, contact_name)
+_pending_sends: Dict[str, tuple] = {}
+
 @mcp.tool()
 def send_message(
     recipient: str,
-    message: str
+    message: str,
+    contact_name: Optional[str] = None,
+    confirmation_code: Optional[str] = None
 ) -> Dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
+
+    IMPORTANT: You MUST first show the draft message to the user and get explicit approval
+    before calling this with confirmed=True. Messages will be BLOCKED unless confirmed=True.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
-    
+        contact_name: Optional display name to save for this contact (e.g. "MKM - Cassie").
+                     If provided, automatically saves the phone->name mapping for future identification.
+        confirmation_code: REQUIRED. Must be True to actually send. Default is False which blocks sending
+                  and returns the message as a draft. Only set to True AFTER the user has reviewed
+                  and explicitly approved the message.
+
     Returns:
         A dictionary containing success status and a status message
     """
+    # SAFETY STEP 1: No code provided — generate one and block the send
+    if not confirmation_code:
+        code = str(random.randint(1000, 9999))
+        _pending_sends[code] = (recipient, message, contact_name)
+        return {
+            "success": False,
+            "message": f"BLOCKED: Message NOT sent. A confirmation code has been generated.\n\nDRAFT to {recipient}:\n{message}\n\nConfirmation code: {code}\n\nShow the draft to the user. After they approve and provide the code, call send_message again with confirmation_code=\"{code}\"."
+        }
+
+    # SAFETY STEP 2: Code provided — validate it matches a pending send
+    if confirmation_code not in _pending_sends:
+        return {
+            "success": False,
+            "message": f"INVALID CODE: \"{confirmation_code}\" does not match any pending message. You must call send_message WITHOUT a code first to generate a new one."
+        }
+
+    # Retrieve and remove the pending send (one-time use)
+    pending_recipient, pending_message, pending_contact_name = _pending_sends.pop(confirmation_code)
+
+    # Verify the message matches what was approved
+    if pending_recipient != recipient or pending_message != message:
+        return {
+            "success": False,
+            "message": "BLOCKED: The recipient or message does not match what was approved. Generate a new code."
+        }
+
     # Validate input
     if not recipient:
         return {
             "success": False,
             "message": "Recipient must be provided"
         }
-    
+
+    # Auto-save contact name if provided (use pending_contact_name if not provided now)
+    save_name = contact_name or pending_contact_name
+    if save_name:
+        phone_clean = recipient.lstrip('+').replace(' ', '').replace('-', '').split('@')[0]
+        whatsapp_save_contact(phone_clean, save_name)
+
     # Call the whatsapp_send_message function with the unified recipient parameter
     success, status_message = whatsapp_send_message(recipient, message)
     return {
@@ -245,6 +294,47 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def save_contact(phone_number: str, name: str) -> Dict[str, Any]:
+    """Save a contact with a display name. This stores the mapping locally so contacts
+    can be identified by name in future messages and searches.
+
+    Args:
+        phone_number: Phone number with country code, no + or spaces (e.g. "447928545139")
+        name: Display name for this contact (e.g. "APS - Andy")
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, message = whatsapp_save_contact(phone_number, name)
+    return {"success": success, "message": message}
+
+
+@mcp.tool()
+def list_saved_contacts() -> Dict[str, str]:
+    """List all locally saved contacts (phone_number -> name mappings).
+
+    Returns:
+        A dictionary of phone_number -> name mappings
+    """
+    return whatsapp_list_saved_contacts()
+
+
+@mcp.tool()
+def resolve_lid(lid_jid: str) -> Dict[str, Any]:
+    """Resolve a WhatsApp LID (Linked ID) to a phone number and contact info.
+    LIDs are opaque identifiers (e.g. '44543760154755@lid') that WhatsApp uses
+    instead of phone numbers in newer protocol versions.
+
+    Args:
+        lid_jid: The LID JID (e.g. '44543760154755@lid' or just '44543760154755')
+
+    Returns:
+        A dictionary with phone_number, push_name, business_name, and local_name
+    """
+    return whatsapp_resolve_lid(lid_jid)
+
 
 if __name__ == "__main__":
     # Initialize and run the server

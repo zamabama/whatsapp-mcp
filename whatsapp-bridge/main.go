@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,9 +22,12 @@ import (
 	"github.com/mdp/qrterminal"
 
 	"bytes"
+	"os/exec"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -48,16 +52,36 @@ type MessageStore struct {
 
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
+	// Use absolute path based on the binary's location so it works from any working directory
+	execPath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get executable path: %v", err)
+	}
+	baseDir := filepath.Dir(execPath)
+	storeDir := filepath.Join(baseDir, "store")
+	dbPath := filepath.Join(storeDir, "messages.db")
+
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
+	fmt.Printf("Messages DB path: %s\n", dbPath)
+
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	// WAL mode ensures writes survive process crashes; synchronous=NORMAL is safe with WAL
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on&_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000", dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
+
+	// Verify WAL mode is active (the pragma must be executed, not just set in DSN on all drivers)
+	var journalMode string
+	if err := db.QueryRow("PRAGMA journal_mode=WAL").Scan(&journalMode); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to set WAL mode: %v", err)
+	}
+	fmt.Printf("SQLite journal mode: %s\n", journalMode)
 
 	// Create tables if they don't exist
 	_, err = db.Exec(`
@@ -410,23 +434,11 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
-	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
-
-	// Update chat in database with the message timestamp (keeps last message time updated)
-	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
-	if err != nil {
-		logger.Warnf("Failed to store chat: %v", err)
-	}
-
-	// Extract text content
+	// Extract text content and media info FIRST — these are pure data extraction, cannot fail
 	content := extractTextContent(msg.Message)
-
-	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
 	// Skip if there's no content and no media
@@ -434,8 +446,18 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
-	// Store message in database
-	err = messageStore.StoreMessage(
+	// CRITICAL: Store the message to SQLite BEFORE anything that touches the network or could panic.
+	// This ensures the message is persisted even if the websocket drops immediately after.
+	// First, ensure the chat row exists (use sender as fallback name — we'll update it below)
+	chatErr := messageStore.StoreChat(chatJID, sender, msg.Info.Timestamp)
+	if chatErr != nil {
+		fmt.Printf("[DEBUG] StoreChat FAILED: %v\n", chatErr)
+	}
+
+	fmt.Printf("[DEBUG] StoreMessage: id=%s chat=%s sender=%s content_len=%d isFromMe=%v\n",
+		msg.Info.ID, chatJID, sender, len(content), msg.Info.IsFromMe)
+
+	err := messageStore.StoreMessage(
 		msg.Info.ID,
 		chatJID,
 		sender,
@@ -452,22 +474,40 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	)
 
 	if err != nil {
+		fmt.Printf("[DEBUG] StoreMessage FAILED: %v\n", err)
 		logger.Warnf("Failed to store message: %v", err)
 	} else {
-		// Log message reception
-		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
-		direction := "←"
-		if msg.Info.IsFromMe {
-			direction = "→"
-		}
-
-		// Log based on message type
-		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
-		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
-		}
+		fmt.Printf("[DEBUG] StoreMessage SUCCESS\n")
+		// Immediately checkpoint WAL so the Python MCP reader sees this message
+		messageStore.db.Exec("PRAGMA wal_checkpoint(PASSIVE)")
 	}
+
+	// Log message reception
+	timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
+	direction := "←"
+	if msg.Info.IsFromMe {
+		direction = "→"
+	}
+	if mediaType != "" {
+		fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+	} else if content != "" {
+		fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+	}
+
+	// NOW do the potentially-failing chat name lookup and update the chat row.
+	// This involves network calls (GetGroupInfo, GetContact) that can fail if websocket drops.
+	// The message is already safely persisted above, so a failure here is non-critical.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Warnf("Recovered from panic in chat name update: %v", r)
+			}
+		}()
+		name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+		if name != "" && name != sender {
+			_ = messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
+		}
+	}()
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -562,7 +602,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	execPath2, _ := os.Executable()
+	baseDir2 := filepath.Dir(execPath2)
+	chatDir := filepath.Join(baseDir2, "store", strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -641,7 +683,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -676,6 +718,23 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
+// sendMacNotification sends a macOS notification via osascript.
+func sendMacNotification(title, message string) {
+	script := fmt.Sprintf(`display notification "%s" with title "%s" sound name "Glass"`, message, title)
+	exec.Command("osascript", "-e", script).Run()
+}
+
+// writeNeedsAuthFlag writes a flag file so external tools can detect auth is needed.
+func writeNeedsAuthFlag(baseDir string) {
+	flagPath := filepath.Join(baseDir, "store", "NEEDS_AUTH")
+	os.WriteFile(flagPath, []byte(fmt.Sprintf("Auth needed since %s\nRun: %s/whatsapp-bridge\nThen scan the QR code from WhatsApp Business app on your phone.\n", time.Now().Format(time.RFC3339), baseDir)), 0644)
+}
+
+// clearNeedsAuthFlag removes the flag file after successful auth.
+func clearNeedsAuthFlag(baseDir string) {
+	os.Remove(filepath.Join(baseDir, "store", "NEEDS_AUTH"))
+}
+
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
@@ -774,6 +833,24 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Health check endpoint — lets MCP server verify bridge is alive and authenticated
+	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		connected := client.IsConnected()
+		loggedIn := client.IsLoggedIn()
+		status := "ok"
+		if !connected {
+			status = "disconnected"
+		} else if !loggedIn {
+			status = "needs_reauth"
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":    status,
+			"connected": connected,
+			"logged_in": loggedIn,
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -791,23 +868,37 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
+	// Present as Chrome browser to avoid third-party client detection
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
+	store.DeviceProps.Os = proto.String("Mac OS")
+	store.SetOSInfo("Mac OS", [3]uint32{10, 15, 7})
+
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	execPath, err := os.Executable()
+	if err != nil {
+		logger.Errorf("Failed to get executable path: %v", err)
+		return
+	}
+	baseDir := filepath.Dir(execPath)
+	storeDir := filepath.Join(baseDir, "store")
+	whatsappDBPath := filepath.Join(storeDir, "whatsapp.db")
+
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", whatsappDBPath), dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -834,10 +925,65 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Reconnection state
+	var reconnectMu sync.Mutex
+	reconnecting := false
+
+	// reconnect attempts to re-establish the WhatsApp websocket connection with exponential backoff.
+	// It is safe to call from multiple goroutines — only one reconnect loop runs at a time.
+	reconnect := func() {
+		reconnectMu.Lock()
+		if reconnecting {
+			reconnectMu.Unlock()
+			return
+		}
+		reconnecting = true
+		reconnectMu.Unlock()
+
+		defer func() {
+			reconnectMu.Lock()
+			reconnecting = false
+			reconnectMu.Unlock()
+		}()
+
+		backoff := 2 * time.Second
+		maxBackoff := 5 * time.Minute
+
+		for attempt := 1; ; attempt++ {
+			logger.Infof("Reconnection attempt %d (backoff %v)...", attempt, backoff)
+			time.Sleep(backoff)
+
+			err := client.Connect()
+			if err == nil {
+				logger.Infof("Reconnected successfully on attempt %d", attempt)
+				return
+			}
+
+			logger.Warnf("Reconnection attempt %d failed: %v", attempt, err)
+
+			// Exponential backoff with jitter
+			backoff = time.Duration(float64(backoff) * 1.5)
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			// Add jitter: +/- 20%
+			jitter := time.Duration(float64(backoff) * (0.8 + rand.Float64()*0.4))
+			backoff = jitter
+		}
+	}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
+			// Debug: log ALL message events
+			fmt.Printf("[DEBUG] Message event: from=%s chat=%s isFromMe=%v hasMsg=%v\n",
+				v.Info.Sender.String(), v.Info.Chat.String(), v.Info.IsFromMe, v.Message != nil)
+			if v.Message != nil {
+				fmt.Printf("[DEBUG] Message proto fields: Conversation=%v ExtendedText=%v\n",
+					v.Message.GetConversation() != "",
+					v.Message.GetExtendedTextMessage() != nil)
+			}
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
 
@@ -848,8 +994,23 @@ func main() {
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
 
+		case *events.Disconnected:
+			logger.Warnf("Disconnected from WhatsApp websocket — will attempt reconnection")
+			go reconnect()
+
+		case *events.StreamError:
+			logger.Warnf("Stream error: %+v — will attempt reconnection", v)
+			go reconnect()
+
+		case *events.StreamReplaced:
+			logger.Warnf("Stream replaced (another device connected?) — will attempt reconnection")
+			go reconnect()
+
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			sendMacNotification("WhatsApp Bridge", "Session expired! Re-auth needed. Stop the service, run the bridge manually, and scan the QR code.")
+			writeNeedsAuthFlag(baseDir)
+			// Do NOT reconnect on logout — re-auth is needed
 		}
 	})
 
@@ -881,6 +1042,7 @@ func main() {
 		select {
 		case <-connected:
 			fmt.Println("\nSuccessfully connected and authenticated!")
+			clearNeedsAuthFlag(baseDir)
 		case <-time.After(3 * time.Minute):
 			logger.Errorf("Timeout waiting for QR code scan")
 			return
@@ -892,6 +1054,7 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
+		clearNeedsAuthFlag(baseDir)
 		connected <- true
 	}
 
@@ -908,6 +1071,34 @@ func main() {
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
 
+	// --- Periodic WAL checkpoint goroutine ---
+	// Ensures the Python MCP reader (which opens a separate connection) always sees
+	// the latest data.  PASSIVE checkpoint does not block writers.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if _, err := messageStore.db.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
+				fmt.Printf("[WAL-CHECKPOINT] error: %v\n", err)
+			}
+		}
+	}()
+
+	// --- Periodic connection health check goroutine ---
+	// Detects silent websocket death (no Disconnected event) and triggers reconnect.
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if !client.IsConnected() {
+				logger.Warnf("[HEALTH-CHECK] Client not connected — triggering reconnect")
+				go reconnect()
+			} else if !client.IsLoggedIn() {
+				logger.Warnf("[HEALTH-CHECK] Client connected but not logged in — may need re-auth")
+			}
+		}
+	}()
+
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
@@ -917,9 +1108,22 @@ func main() {
 	// Wait for termination signal
 	<-exitChan
 
-	fmt.Println("Disconnecting...")
-	// Disconnect client
+	fmt.Println("Shutting down gracefully...")
+
+	// 1. Disconnect the WhatsApp client first (stops new events from arriving)
 	client.Disconnect()
+
+	// 2. Small delay to let any in-flight handleMessage goroutines finish their DB writes
+	time.Sleep(500 * time.Millisecond)
+
+	// 3. Close the message store (flushes SQLite WAL)
+	// Note: messageStore.Close() is also deferred above, but explicit close here ensures
+	// WAL checkpoint happens before process exit
+	if err := messageStore.Close(); err != nil {
+		logger.Warnf("Error closing message store: %v", err)
+	}
+
+	fmt.Println("Shutdown complete.")
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
@@ -973,7 +1177,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1192,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

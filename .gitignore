@@ -1,3 +1,21 @@
+## Databases (contain message history and auth credentials)
 *.db
+*.db-shm
+*.db-wal
+
+## Config files with credentials
 claude_desktop_config.json
-whatsapp.log
+
+## Logs
+*.log
+
+## Downloaded media and message store
+whatsapp-bridge/store/
+
+## Compiled binary (platform-specific, rebuild from source)
+whatsapp-bridge/whatsapp-bridge
+
+## Python cache
+__pycache__/
+*.pyc
+.venv/

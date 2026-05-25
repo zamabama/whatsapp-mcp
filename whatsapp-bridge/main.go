@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -36,6 +37,11 @@ import (
 )
 
 // Message represents a chat message for our client
+// bridgeVersion identifies this bridge binary build. It is exposed via /api/health
+// so the MCP reader (and an agent) can confirm the live bridge is the updated build.
+// Keep in sync with MCP_SERVER_VERSION in whatsapp.py.
+const bridgeVersion = "1.2.0-message-ordering"
+
 type Message struct {
 	Time      time.Time
 	Sender    string
@@ -57,16 +63,19 @@ func NewMessageStore() (*MessageStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get executable path: %v", err)
 	}
-	baseDir := filepath.Dir(execPath)
-	storeDir := filepath.Join(baseDir, "store")
-	dbPath := filepath.Join(storeDir, "messages.db")
+	dbPath := filepath.Join(filepath.Dir(execPath), "store", "messages.db")
+	fmt.Printf("Messages DB path: %s\n", dbPath)
+	return newMessageStoreAt(dbPath)
+}
 
+// newMessageStoreAt opens (and migrates) the messages database at the given path.
+// Split out from NewMessageStore so tests can target a temporary database instead
+// of the live store next to the binary.
+func newMessageStoreAt(dbPath string) (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll(storeDir, 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
-
-	fmt.Printf("Messages DB path: %s\n", dbPath)
 
 	// Open SQLite database for messages
 	// WAL mode ensures writes survive process crashes; synchronous=NORMAL is safe with WAL
@@ -90,7 +99,7 @@ func NewMessageStore() (*MessageStore, error) {
 			name TEXT,
 			last_message_time TIMESTAMP
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -114,6 +123,20 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Additive migration: quoted/reply-context columns. Older databases created before
+	// this feature won't have them, so add them on startup. ALTER TABLE ADD COLUMN is
+	// idempotent here because we tolerate the "duplicate column name" error on re-runs.
+	for _, stmt := range []string{
+		`ALTER TABLE messages ADD COLUMN quoted_message_id TEXT`,
+		`ALTER TABLE messages ADD COLUMN quoted_text TEXT`,
+		`ALTER TABLE messages ADD COLUMN quoted_sender TEXT`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			db.Close()
+			return nil, fmt.Errorf("failed to migrate quoted-context columns: %v", err)
+		}
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -133,18 +156,96 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedID, quotedText, quotedSender string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_text, quoted_sender)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, quotedID, quotedText, quotedSender,
 	)
+	return err
+}
+
+// StoreChatAndMessage atomically upserts the chat's last_message_time and inserts
+// the message body in a SINGLE transaction. This is the fix for the storage-lag /
+// divergence bug: writing both in one transaction means they become visible to an
+// external reader at the same instant (on COMMIT), so a reader can never observe a
+// chat whose last_message_time is newer than its newest stored message. If the
+// message insert fails, the chat update rolls back too — no permanent divergence.
+//
+// The chat is upserted before the message inside the transaction to satisfy the
+// messages→chats foreign key, but because nothing commits until the end, ordering
+// inside the transaction is invisible to other connections.
+func (store *MessageStore) StoreChatAndMessage(
+	chatJID, chatName string,
+	id, sender, content string, timestamp time.Time, isFromMe bool,
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedID, quotedText, quotedSender string,
+) error {
+	// Contentless messages (reactions, receipts, protocol messages) are not stored,
+	// and must not create a chat row or advance last_message_time — doing so is what
+	// produced chats whose last_message_time had no corresponding message.
+	if content == "" && mediaType == "" {
+		return nil
+	}
+
+	tx, err := store.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() // no-op once Commit succeeds; cleans up on any error path
+
+	// Upsert the chat: set last_message_time to this message's timestamp, preserving any
+	// name already resolved by the async name-updater (don't clobber it back to the raw
+	// sender). On a brand-new chat, seed the name with the fallback.
+	//
+	// We do NOT compare timestamps here. last_message_time is always set to a message we
+	// store in this same transaction, so it can never point at a message that doesn't
+	// exist. Chronological ordering across the DB's mixed timestamp text formats (space-
+	// vs 'T'-separated) is handled where it belongs — the MCP reader wraps every
+	// comparison/ORDER BY in datetime(); see whatsapp.py.
+	if _, err := tx.Exec(
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET last_message_time = excluded.last_message_time`,
+		chatJID, chatName, timestamp,
+	); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_text, quoted_sender)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, quotedID, quotedText, quotedSender,
+	); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// UpdateChatName updates only the chat's display name, leaving last_message_time
+// untouched. Used by the async name-resolver after a message is already stored, so
+// resolving the name can never move last_message_time (and thus can never create or
+// re-introduce divergence).
+func (store *MessageStore) UpdateChatName(jid, name string) error {
+	_, err := store.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, jid)
+	return err
+}
+
+// UpdateChatLastMessageTime sets a chat's last_message_time to the timestamp of a
+// message we actually stored. Used after a history-sync batch so the chat never
+// claims a last_message_time newer than its newest stored message (history sync
+// otherwise set it from the conversation's latest message even when that message was
+// a non-text/non-media type that got skipped).
+func (store *MessageStore) UpdateChatLastMessageTime(jid string, t time.Time) error {
+	_, err := store.db.Exec("UPDATE chats SET last_message_time = ? WHERE jid = ?", t, jid)
 	return err
 }
 
@@ -211,6 +312,94 @@ func extractTextContent(msg *waProto.Message) string {
 
 	// For now, we're ignoring non-text messages
 	return ""
+}
+
+// extractQuotedContext pulls the quoted/reply reference from a message's contextInfo,
+// if present. WhatsApp attaches a ContextInfo block to reply messages identifying the
+// message being replied to. Returns the quoted message's stanza ID, a short text
+// snippet of the quoted message, and the JID of whoever sent the quoted message.
+// All three are empty when the message is not a reply.
+func extractQuotedContext(msg *waProto.Message) (quotedID, quotedText, quotedSender string) {
+	if msg == nil {
+		return "", "", ""
+	}
+	ci := messageContextInfo(msg)
+	if ci == nil || ci.GetStanzaID() == "" {
+		return "", "", ""
+	}
+	return ci.GetStanzaID(), quotedSnippet(ci.GetQuotedMessage()), ci.GetParticipant()
+}
+
+// messageContextInfo returns the ContextInfo from whichever sub-message carries it.
+// ContextInfo lives on the specific message type (extended text, image caption, etc.),
+// not on the top-level Message, so we check the common reply-bearing types.
+func messageContextInfo(msg *waProto.Message) *waProto.ContextInfo {
+	switch {
+	case msg.GetExtendedTextMessage() != nil:
+		return msg.GetExtendedTextMessage().GetContextInfo()
+	case msg.GetImageMessage() != nil:
+		return msg.GetImageMessage().GetContextInfo()
+	case msg.GetVideoMessage() != nil:
+		return msg.GetVideoMessage().GetContextInfo()
+	case msg.GetDocumentMessage() != nil:
+		return msg.GetDocumentMessage().GetContextInfo()
+	case msg.GetAudioMessage() != nil:
+		return msg.GetAudioMessage().GetContextInfo()
+	case msg.GetStickerMessage() != nil:
+		return msg.GetStickerMessage().GetContextInfo()
+	}
+	return nil
+}
+
+// quotedSnippet returns a short, bounded text representation of a quoted message so
+// the reader can tell what a reply refers to. Falls back to captions or a type marker
+// for media so a reply to a photo still reads sensibly.
+func quotedSnippet(quoted *waProto.Message) string {
+	if quoted == nil {
+		return ""
+	}
+	text := extractTextContent(quoted)
+	if text == "" {
+		switch {
+		case quoted.GetImageMessage() != nil:
+			text = mediaMarker("[image]", quoted.GetImageMessage().GetCaption())
+		case quoted.GetVideoMessage() != nil:
+			text = mediaMarker("[video]", quoted.GetVideoMessage().GetCaption())
+		case quoted.GetDocumentMessage() != nil:
+			text = mediaMarker("[document]", firstNonEmpty(quoted.GetDocumentMessage().GetCaption(), quoted.GetDocumentMessage().GetFileName()))
+		case quoted.GetAudioMessage() != nil:
+			text = "[audio]"
+		case quoted.GetStickerMessage() != nil:
+			text = "[sticker]"
+		}
+	}
+
+	// Bound the stored snippet so a long quoted message doesn't bloat the row.
+	const maxQuotedLen = 200
+	if r := []rune(text); len(r) > maxQuotedLen {
+		text = string(r[:maxQuotedLen]) + "…"
+	}
+	return text
+}
+
+// firstNonEmpty returns the first non-empty string from the arguments, or "".
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// mediaMarker labels a quoted media message so it's recognisable as e.g. an image,
+// keeping the caption when there is one (e.g. "[image] Option A") and just the marker
+// when there isn't (e.g. "[image]").
+func mediaMarker(label, caption string) string {
+	if caption == "" {
+		return label
+	}
+	return label + " " + caption
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -440,26 +629,27 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract text content and media info FIRST — these are pure data extraction, cannot fail
 	content := extractTextContent(msg.Message)
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+	quotedID, quotedText, quotedSender := extractQuotedContext(msg.Message)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
 		return
 	}
 
-	// CRITICAL: Store the message to SQLite BEFORE anything that touches the network or could panic.
-	// This ensures the message is persisted even if the websocket drops immediately after.
-	// First, ensure the chat row exists (use sender as fallback name — we'll update it below)
-	chatErr := messageStore.StoreChat(chatJID, sender, msg.Info.Timestamp)
-	if chatErr != nil {
-		fmt.Printf("[DEBUG] StoreChat FAILED: %v\n", chatErr)
-	}
-
-	fmt.Printf("[DEBUG] StoreMessage: id=%s chat=%s sender=%s content_len=%d isFromMe=%v\n",
+	// CRITICAL: Persist the chat metadata and the message body in ONE transaction so
+	// they become visible to the external MCP reader at the same instant (on COMMIT).
+	// Writing them separately (chat first, as before) let a reader observe a chat whose
+	// last_message_time was newer than its newest stored message; one transaction makes
+	// that impossible, and if the message insert fails the chat update rolls back too.
+	// The fallback name `sender` is upgraded later by the async resolver below, which
+	// touches only the name and never last_message_time.
+	fmt.Printf("[DEBUG] StoreChatAndMessage: id=%s chat=%s sender=%s content_len=%d isFromMe=%v\n",
 		msg.Info.ID, chatJID, sender, len(content), msg.Info.IsFromMe)
 
-	err := messageStore.StoreMessage(
-		msg.Info.ID,
+	err := messageStore.StoreChatAndMessage(
 		chatJID,
+		sender,
+		msg.Info.ID,
 		sender,
 		content,
 		msg.Info.Timestamp,
@@ -471,13 +661,16 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedID,
+		quotedText,
+		quotedSender,
 	)
 
 	if err != nil {
-		fmt.Printf("[DEBUG] StoreMessage FAILED: %v\n", err)
+		fmt.Printf("[DEBUG] StoreChatAndMessage FAILED: %v\n", err)
 		logger.Warnf("Failed to store message: %v", err)
 	} else {
-		fmt.Printf("[DEBUG] StoreMessage SUCCESS\n")
+		fmt.Printf("[DEBUG] StoreChatAndMessage SUCCESS\n")
 		// Immediately checkpoint WAL so the Python MCP reader sees this message
 		messageStore.db.Exec("PRAGMA wal_checkpoint(PASSIVE)")
 	}
@@ -505,7 +698,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}()
 		name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 		if name != "" && name != sender {
-			_ = messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
+			// Update only the name — last_message_time was already set atomically with
+			// the message above, and must not be moved by name resolution.
+			_ = messageStore.UpdateChatName(chatJID, name)
 		}
 	}()
 }
@@ -848,6 +1043,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			"status":    status,
 			"connected": connected,
 			"logged_in": loggedIn,
+			"version":   bridgeVersion,
 		})
 	})
 
@@ -956,6 +1152,10 @@ func main() {
 			err := client.Connect()
 			if err == nil {
 				logger.Infof("Reconnected successfully on attempt %d", attempt)
+				// History sync disabled on reconnect — was causing nil-pointer panic in BuildHistorySyncRequest
+				// when client state was reset between IsConnected() and BuildHistorySyncRequest().
+				// New messages still flow via the live WS stream; only historical catch-up is skipped.
+				// go requestHistorySync(client)
 				return
 			}
 
@@ -1068,8 +1268,23 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server. The port is read from WHATSAPP_BRIDGE_PORT so the SAME
+	// binary can serve multiple WhatsApp accounts on one machine — each deployment sets
+	// its own port (and uses its own store/ directory for the account + DB). The
+	// resolved port is written to store/bridge_port.txt so the co-located MCP reader can
+	// discover it without per-project config.
+	port := 8080
+	if p := os.Getenv("WHATSAPP_BRIDGE_PORT"); p != "" {
+		if n, err := strconv.Atoi(p); err == nil {
+			port = n
+		} else {
+			logger.Warnf("Invalid WHATSAPP_BRIDGE_PORT %q, falling back to %d", p, port)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(storeDir, "bridge_port.txt"), []byte(strconv.Itoa(port)), 0644); err != nil {
+		logger.Warnf("Failed to write bridge_port.txt: %v", err)
+	}
+	startRESTServer(client, messageStore, port)
 
 	// --- Periodic WAL checkpoint goroutine ---
 	// Ensures the Python MCP reader (which opens a separate connection) always sees
@@ -1249,9 +1464,16 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				continue
 			}
 
+			// Register the chat first so the messages foreign key is satisfied. Its
+			// last_message_time is corrected below to the newest message we actually
+			// store — the conversation's latest message may be a non-text/non-media
+			// type that gets skipped, which previously left the chat's timestamp ahead
+			// of any stored message.
 			messageStore.StoreChat(chatJID, name, timestamp)
 
-			// Store messages
+			// Store messages, tracking the newest timestamp we actually persist.
+			var latestStored time.Time
+			storedAny := false
 			for _, msg := range messages {
 				if msg == nil || msg.Message == nil {
 					continue
@@ -1274,6 +1496,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 				if msg.Message.Message != nil {
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+				}
+
+				// Extract quoted/reply context
+				var quotedID, quotedText, quotedSender string
+				if msg.Message.Message != nil {
+					quotedID, quotedText, quotedSender = extractQuotedContext(msg.Message.Message)
 				}
 
 				// Log the message content for debugging
@@ -1330,11 +1558,18 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					quotedID,
+					quotedText,
+					quotedSender,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
+					if timestamp.After(latestStored) {
+						latestStored = timestamp
+					}
+					storedAny = true
 					// Log successful message storage
 					if mediaType != "" {
 						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
@@ -1344,6 +1579,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
 					}
 				}
+			}
+
+			// Correct last_message_time to the newest message we actually stored, so
+			// external readers never see a chat whose last_message_time is ahead of its
+			// stored messages. (Content-less conversations keep the latest timestamp set
+			// above so the chat still surfaces — there is no stored message to be ahead of.)
+			if storedAny {
+				messageStore.UpdateChatLastMessageTime(chatJID, latestStored)
 			}
 		}
 	}

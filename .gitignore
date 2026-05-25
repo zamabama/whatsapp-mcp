@@ -14,6 +14,8 @@ whatsapp-bridge/store/
 
 ## Compiled binary (platform-specific, rebuild from source)
 whatsapp-bridge/whatsapp-bridge
+## Binary backups / build artifacts (e.g. .bak, .new, .pre-ordering-fix)
+whatsapp-bridge/whatsapp-bridge.*
 
 ## Python cache
 __pycache__/

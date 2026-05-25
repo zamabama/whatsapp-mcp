@@ -17,6 +17,7 @@ from whatsapp import (
     save_contact as whatsapp_save_contact,
     list_saved_contacts as whatsapp_list_saved_contacts,
     resolve_lid as whatsapp_resolve_lid,
+    get_version as whatsapp_get_version,
 )
 
 # Initialize FastMCP server
@@ -334,6 +335,21 @@ def resolve_lid(lid_jid: str) -> Dict[str, Any]:
         A dictionary with phone_number, push_name, business_name, and local_name
     """
     return whatsapp_resolve_lid(lid_jid)
+
+
+@mcp.tool()
+def whatsapp_version() -> Dict[str, Any]:
+    """Report the version of this WhatsApp MCP server and the live bridge binary.
+
+    Use this to confirm whether this session is running the updated build. A result
+    with mcp_server_version "1.1.0-quoted-reply" (and "quoted-reply-context" in
+    features) means quoted/reply context is supported here. If this tool does not
+    exist at all, the session is on an older build and should be reloaded.
+
+    Returns:
+        A dictionary with mcp_server_version, bridge_version, and supported features
+    """
+    return whatsapp_get_version()
 
 
 if __name__ == "__main__":

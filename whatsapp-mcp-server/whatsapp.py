@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
@@ -7,11 +8,65 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
-LOCAL_CONTACTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'local_contacts.json')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
-NEEDS_AUTH_FLAG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'NEEDS_AUTH')
+_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store')
+MESSAGES_DB_PATH = os.path.join(_STORE_DIR, 'messages.db')
+WHATSAPP_DB_PATH = os.path.join(_STORE_DIR, 'whatsapp.db')
+LOCAL_CONTACTS_PATH = os.path.join(_STORE_DIR, 'local_contacts.json')
+NEEDS_AUTH_FLAG_PATH = os.path.join(_STORE_DIR, 'NEEDS_AUTH')
+
+
+def _resolve_bridge_port() -> str:
+    """Find the port the co-located bridge listens on, so one codebase serves multiple
+    accounts. Order: WHATSAPP_BRIDGE_PORT env -> store/bridge_port.txt written by the
+    bridge -> 8080 default. This keeps the per-account port out of the source and out of
+    every project's .mcp.json."""
+    env_port = os.environ.get("WHATSAPP_BRIDGE_PORT")
+    if env_port and env_port.strip().isdigit():
+        return env_port.strip()
+    try:
+        with open(os.path.join(_STORE_DIR, 'bridge_port.txt')) as f:
+            file_port = f.read().strip()
+            if file_port.isdigit():
+                return file_port
+    except OSError:
+        pass
+    return "8080"
+
+
+WHATSAPP_BRIDGE_PORT = _resolve_bridge_port()
+WHATSAPP_API_BASE_URL = f"http://localhost:{WHATSAPP_BRIDGE_PORT}/api"
+
+# Bump this whenever the MCP reader's behaviour changes, so an agent can self-report
+# whether it is running the updated code. An agent that returns this string from the
+# `whatsapp_version` tool is on the new build; an agent whose tool list lacks that tool
+# is on an old build and needs its session/MCP server reloaded.
+MCP_SERVER_VERSION = "1.2.0-message-ordering"
+
+
+def _build_version_info(bridge_version: Optional[str]) -> dict:
+    """Assemble the version payload. Pure (no I/O) so it can be unit-tested."""
+    return {
+        "mcp_server_version": MCP_SERVER_VERSION,
+        "bridge_version": bridge_version or "unknown (bridge did not report a version)",
+        "features": ["quoted-reply-context"],
+    }
+
+
+def get_version() -> dict:
+    """Report the MCP reader version and, best-effort, the live bridge binary version.
+
+    The MCP server version is what determines whether THIS agent renders quoted-reply
+    context (it runs per-session). The bridge version reflects the shared background
+    binary that captures the data. Both should read "1.1.0-quoted-reply" when updated.
+    """
+    bridge_version = None
+    try:
+        resp = requests.get(f"{WHATSAPP_API_BASE_URL}/health", timeout=3)
+        if resp.ok:
+            bridge_version = resp.json().get("version")
+    except requests.RequestException:
+        bridge_version = None
+    return _build_version_info(bridge_version)
 
 
 def check_bridge_health() -> str:
@@ -45,7 +100,7 @@ def check_bridge_health() -> str:
         else:
             return f"BRIDGE ERROR: health endpoint returned HTTP {resp.status_code}"
     except requests.ConnectionError:
-        return ("BRIDGE NOT RUNNING: Cannot connect to the WhatsApp bridge on localhost:8080. "
+        return (f"BRIDGE NOT RUNNING: Cannot connect to the WhatsApp bridge on localhost:{WHATSAPP_BRIDGE_PORT}. "
                 "Check if the LaunchAgent is loaded: 'launchctl list | grep whatsapp'")
     except requests.Timeout:
         return "BRIDGE TIMEOUT: Health check timed out after 3 seconds."
@@ -58,6 +113,21 @@ def _connect_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
+
+
+def _ensure_quoted_columns(conn: sqlite3.Connection) -> None:
+    """Make sure the quoted/reply-context columns exist before we read them.
+
+    The Go bridge owns the schema and adds these on startup, but if the MCP server
+    is (re)loaded before the bridge has restarted, the columns may not exist yet.
+    This additive migration is idempotent — it tolerates columns that already exist.
+    """
+    for column in ("quoted_message_id", "quoted_text", "quoted_sender"):
+        try:
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.commit()
 
 
 def _load_local_contacts() -> dict:
@@ -156,6 +226,10 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+    # Quoted/reply context: set when this message is a reply to an earlier one.
+    quoted_id: Optional[str] = None
+    quoted_text: Optional[str] = None
+    quoted_sender: Optional[str] = None
 
 @dataclass
 class Chat:
@@ -273,6 +347,19 @@ def get_sender_name(sender_jid: str) -> str:
         if 'conn' in locals():
             conn.close()
 
+def format_quoted_prefix(sender_name: str, quoted_text: str, max_len: int = 80) -> str:
+    """Render the '↳ replying to ...' line shown above a reply message.
+
+    Pure string formatting (no DB) so it can be unit-tested directly. The snippet is
+    collapsed to a single line and bounded so long quoted messages stay readable.
+    """
+    snippet = (quoted_text or "").replace("\n", " ").strip()
+    if len(snippet) > max_len:
+        snippet = snippet[:max_len].rstrip() + "…"
+    who = sender_name or "?"
+    return f'↳ replying to {who}: "{snippet}"'
+
+
 def format_message(message: Message, show_chat_info: bool = True) -> None:
     """Print a single message with consistent formatting."""
     output = ""
@@ -288,6 +375,12 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
     
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
+        # If this message is a reply, show what it's replying to on its own line above.
+        quoted_text = getattr(message, "quoted_text", None)
+        if quoted_text:
+            quoted_sender_jid = getattr(message, "quoted_sender", None)
+            quoted_name = get_sender_name(quoted_sender_jid) if quoted_sender_jid else "?"
+            output += "  " + format_quoted_prefix(quoted_name, quoted_text) + "\n"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
@@ -324,10 +417,11 @@ def list_messages(
     """Get messages matching the specified criteria with optional context."""
     try:
         conn = _connect_db(MESSAGES_DB_PATH)
+        _ensure_quoted_columns(conn)
         cursor = conn.cursor()
-        
+
         # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
+        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.quoted_text, messages.quoted_sender FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
         params = []
@@ -339,7 +433,9 @@ def list_messages(
             except ValueError:
                 raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
             
-            where_clauses.append("messages.timestamp > ?")
+            # datetime() normalizes the mixed stored formats (space- vs 'T'-separated,
+            # with timezone offset) so the comparison is chronological, not lexical.
+            where_clauses.append("datetime(messages.timestamp) > datetime(?)")
             params.append(after)
 
         if before:
@@ -348,7 +444,7 @@ def list_messages(
             except ValueError:
                 raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
             
-            where_clauses.append("messages.timestamp < ?")
+            where_clauses.append("datetime(messages.timestamp) < datetime(?)")
             params.append(before)
 
         if sender_phone_number:
@@ -368,7 +464,7 @@ def list_messages(
             
         # Add pagination
         offset = page * limit
-        query_parts.append("ORDER BY messages.timestamp DESC")
+        query_parts.append("ORDER BY datetime(messages.timestamp) DESC")
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
         
@@ -385,7 +481,10 @@ def list_messages(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                quoted_id=msg[8],
+                quoted_text=msg[9],
+                quoted_sender=msg[10]
             )
             result.append(message)
             
@@ -419,20 +518,21 @@ def get_message_context(
     """Get context around a specific message."""
     try:
         conn = _connect_db(MESSAGES_DB_PATH)
+        _ensure_quoted_columns(conn)
         cursor = conn.cursor()
-        
+
         # Get the target message first
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.quoted_message_id, messages.quoted_text, messages.quoted_sender
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.id = ?
         """, (message_id,))
         msg_data = cursor.fetchone()
-        
+
         if not msg_data:
             raise ValueError(f"Message with ID {message_id} not found")
-            
+
         target_message = Message(
             timestamp=datetime.fromisoformat(msg_data[0]),
             sender=msg_data[1],
@@ -441,19 +541,22 @@ def get_message_context(
             is_from_me=msg_data[4],
             chat_jid=msg_data[5],
             id=msg_data[6],
-            media_type=msg_data[8]
+            media_type=msg_data[8],
+            quoted_id=msg_data[9],
+            quoted_text=msg_data[10],
+            quoted_sender=msg_data[11]
         )
         
         # Get messages before
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.quoted_text, messages.quoted_sender
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.chat_jid = ? AND messages.timestamp < ?
-            ORDER BY messages.timestamp DESC
+            WHERE messages.chat_jid = ? AND datetime(messages.timestamp) < datetime(?)
+            ORDER BY datetime(messages.timestamp) DESC
             LIMIT ?
         """, (msg_data[7], msg_data[0], before))
-        
+
         before_messages = []
         for msg in cursor.fetchall():
             before_messages.append(Message(
@@ -464,19 +567,22 @@ def get_message_context(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                quoted_id=msg[8],
+                quoted_text=msg[9],
+                quoted_sender=msg[10]
             ))
         
         # Get messages after
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.quoted_text, messages.quoted_sender
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.chat_jid = ? AND messages.timestamp > ?
-            ORDER BY messages.timestamp ASC
+            WHERE messages.chat_jid = ? AND datetime(messages.timestamp) > datetime(?)
+            ORDER BY datetime(messages.timestamp) ASC
             LIMIT ?
         """, (msg_data[7], msg_data[0], after))
-        
+
         after_messages = []
         for msg in cursor.fetchall():
             after_messages.append(Message(
@@ -487,7 +593,10 @@ def get_message_context(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                quoted_id=msg[8],
+                quoted_text=msg[9],
+                quoted_sender=msg[10]
             ))
         
         return MessageContext(
@@ -545,7 +654,7 @@ def list_chats(
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
         # Add sorting
-        order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
+        order_by = "datetime(chats.last_message_time) DESC" if sort_by == "last_active" else "chats.name"
         query_parts.append(f"ORDER BY {order_by}")
         
         # Add pagination
@@ -722,7 +831,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
             WHERE m.sender = ? OR c.jid = ?
-            ORDER BY c.last_message_time DESC
+            ORDER BY datetime(c.last_message_time) DESC
             LIMIT ? OFFSET ?
         """, (jid, jid, limit, page * limit))
         
@@ -769,7 +878,7 @@ def get_last_interaction(jid: str) -> str:
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
             WHERE m.sender = ? OR c.jid = ?
-            ORDER BY m.timestamp DESC
+            ORDER BY datetime(m.timestamp) DESC
             LIMIT 1
         """, (jid, jid))
         

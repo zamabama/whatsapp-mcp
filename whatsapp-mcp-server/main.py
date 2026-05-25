@@ -21,7 +21,35 @@ from whatsapp import (
 )
 
 # Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+# `instructions` is surfaced to the agent automatically whenever this MCP is loaded
+# (the same way Photon's rules appear in the prompt), so the non-obvious usage rules
+# below don't have to be rediscovered per session.
+WHATSAPP_MCP_INSTRUCTIONS = """\
+WhatsApp bridge (whatsmeow + SQLite). One codebase serves multiple accounts on this
+machine (e.g. personal :8180, business :8179), selected per project via .mcp.json; ops
+details are in the bridge repo's DEPLOYMENT.md.
+
+Non-obvious rules — follow these or you WILL silently miss messages:
+
+1. CONTACTS ARE IDENTIFIED BY @lid JID, NOT PHONE NUMBER. A contact's stored JID is
+   usually a LID like `215680423059643@lid`, not `<phone>@s.whatsapp.net`. Find the JID
+   with list_chats / search_contacts / get_chat / resolve_lid. Never guess or build a JID
+   from a phone number, and never assume phone == JID. A wrong JID returns "no messages"
+   even when the thread is full of replies.
+
+2. READ ONLY THROUGH THESE TOOLS — NEVER raw SQL on store/messages.db. The DB stores
+   timestamps in TWO text formats (space-separated from the Go bridge, 'T'-separated from
+   the Python outbound logger). A raw MAX(timestamp) or ORDER BY timestamp sorts them
+   lexically (' ' < 'T'), which buries recent INBOUND messages below older OUTBOUND ones —
+   so raw queries report a thread as "quiet" when the vendor actually replied. These tools
+   normalize with datetime(); raw SQL does not. If you must touch the DB, wrap every
+   timestamp comparison/ORDER BY in datetime().
+
+3. A chat's last_message_time reflects its newest stored message (chat+message are written
+   in one transaction, bridge >= 1.2.0-message-ordering), so trust list_chats ordering from
+   the tools rather than recomputing it from the raw table.
+"""
+mcp = FastMCP("whatsapp", instructions=WHATSAPP_MCP_INSTRUCTIONS)
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
